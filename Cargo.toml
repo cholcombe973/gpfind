@@ -1,0 +1,12 @@
+[package]
+name = "gpfind"
+version = "0.1.0"
+authors = ["Chris Holcombe <xfactor973@gmail.com>"]
+description = "Gluster Parallel Find"
+license = "MIT"
+
+[dependencies]
+clap = "*"
+crossbeam = "*"
+gfapi-sys = "*"
+libc = "*"
