@@ -21,56 +21,72 @@ use simplelog::{Config, TermLogger};
 
 // Print all the files in the directories from the queu
 fn print(queue: &MsQueue<PathBuf>, pool: &mut Pool, cluster: &mut Gluster) {
-    pool.scoped(|scoped| {
-        // Push directories onto the queue
-        scoped.execute(|| {
-            // TODO: This needs to try with a timeout
-            let p = match queue.try_pop() {
-                Some(p) => p,
-                None => {
-                    //done = true;
-                    return;
+    let mut done = false;
+    while !done {
+        // Use the rest of the threads in the pool to print directories
+        pool.scoped(|scoped| {
+            // Push directories onto the queue
+            scoped.execute(|| {
+                // TODO: This needs to try with a timeout
+                let p = match queue.try_pop() {
+                    Some(p) => p,
+                    None => {
+                        done = true;
+                        return;
+                    }
+                };
+                let sub_dir = GlusterDirectory {
+                    dir_handle: cluster
+                        .opendir(&p)
+                        .expect(&format!("failed to open dir: {}", p.display())),
+                };
+                for s in sub_dir {
+                    match s.file_type {
+                        DT_REG => {
+                            println!("{}/{}", p.display(), s.path.display());
+                        }
+                        _ => {
+                            //Nothing
+                        }
+                    }
                 }
-            };
-            let sub_dir = GlusterDirectory { dir_handle: cluster.opendir(&p).unwrap() };
-            for s in sub_dir {
-                match s.file_type {
-                    DT_REG => {
-                        println!("{}/{}", p.display(), s.path.display());
-                    }
-                    _ => {
-                        //Nothing
-                    }
+            })
+        });
+    }
+}
+
+fn search(queue: &MsQueue<PathBuf>, p: &Path, mut cluster: &mut Gluster) {
+    let this = Path::new(".");
+    let parent = Path::new("..");
+    let sub_dir = GlusterDirectory {
+        dir_handle: cluster
+            .opendir(&p)
+            .expect(&format!("failed to open dir: {}", p.display())),
+    };
+    for s in sub_dir {
+        match s.file_type {
+            DT_DIR => {
+                if !(s.path == this || s.path == parent) {
+                    // Push the dir onto the queue for another thread to handle
+                    let mut pbuff = PathBuf::from(p);
+                    pbuff.push(s.path);
+                    queue.push(pbuff.clone());
+                    search(&queue, &pbuff, &mut cluster);
                 }
             }
-        })
-    });
+            _ => {
+                //Nothing
+            }
+        }
+    }
 }
 
 // Find all the directories and push them onto the queue
-fn find_dirs(queue: &MsQueue<PathBuf>, pool: &mut Pool, p: &Path, cluster: &mut Gluster) {
+fn find_dirs(queue: &MsQueue<PathBuf>, pool: &mut Pool, p: &Path, mut cluster: &mut Gluster) {
     pool.scoped(|scoped| {
-        // Push directories onto the queue
+        // Assign a single thread to searching recursively for directories
         scoped.execute(|| {
-            let this = Path::new(".");
-            let parent = Path::new("..");
-            //TODO: This needs to keep decending 
-            let sub_dir = GlusterDirectory { dir_handle: cluster.opendir(p).unwrap() };
-            for s in sub_dir {
-                match s.file_type {
-                    DT_DIR => {
-                        if !(s.path == this || s.path == parent) {
-                            // Push the dir onto the queue for another thread to handle
-                            let mut pbuff = PathBuf::from(p);
-                            pbuff.push(s.path);
-                            queue.push(pbuff);
-                        }
-                    }
-                    _ => {
-                        //Nothing
-                    }
-                }
-            }
+            search(&queue, &p, &mut cluster);
         })
     });
 }
@@ -86,18 +102,19 @@ fn list(
     let mut cluster = Gluster::connect(volume, server, port)?;
 
     //Helpers to avoid adding self and parent paths
-    let this = Path::new(".");
-    let parent = Path::new("..");
+    //let this = Path::new(".");
+    //let parent = Path::new("..");
 
     let queue = MsQueue::new();
     // Seed the queue with the first directory path
     queue.push(path.to_path_buf());
-    let mut done = false;
+    //let mut done = false;
 
     let mut worker_pool = Pool::new(workers);
     find_dirs(&queue, &mut worker_pool, path, &mut cluster);
     print(&queue, &mut worker_pool, &mut cluster);
 
+    /*
     while !done {
         worker_pool.scoped(|scoped| {
             // Push directories onto the queue
@@ -109,7 +126,9 @@ fn list(
                         return;
                     }
                 };
-                let sub_dir = GlusterDirectory { dir_handle: cluster.opendir(&p).unwrap() };
+                let sub_dir = GlusterDirectory {
+                    dir_handle: cluster.opendir(&p).unwrap(),
+                };
                 for s in sub_dir {
                     match s.file_type {
                         DT_REG => {
@@ -131,6 +150,7 @@ fn list(
             });
         });
     }
+    */
     Ok(())
 }
 
