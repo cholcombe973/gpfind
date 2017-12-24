@@ -1,83 +1,113 @@
 #[macro_use]
 extern crate clap;
-extern crate crossbeam;
 extern crate gfapi_sys;
 extern crate libc;
 #[macro_use]
 extern crate log;
-extern crate scoped_threadpool;
+extern crate multiqueue;
+extern crate r2d2;
+extern crate r2d2_gluster;
 extern crate simplelog;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::thread;
 
 use clap::{App, Arg};
-use crossbeam::sync::MsQueue;
 use gfapi_sys::gluster::*;
 use libc::{DT_DIR, DT_REG};
 use log::LogLevelFilter;
-use scoped_threadpool::Pool;
+use multiqueue::{broadcast_queue, BroadcastReceiver, BroadcastSender};
+use r2d2_gluster::*;
+use r2d2::Pool;
 use simplelog::{Config, TermLogger};
 
-fn list(
-    server: &str,
-    port: u16,
-    volume: &str,
-    path: &Path,
-    workers: u32,
-) -> Result<(), GlusterError> {
-    println!("Connecting to: {}", server);
-    let cluster = Gluster::connect(volume, server, port)?;
-
-    //Helpers to avoid adding self and parent paths
-    let this = Path::new(".");
-    let parent = Path::new("..");
-
-    let mut queue = MsQueue::new();
-    // Seed the queue with the first directory path
-    queue.push(path.to_path_buf());
-    let mut done = false;
-
-    let mut worker_pool = Pool::new(workers);
-
-    while !done {
-        worker_pool.scoped(|scoped| {
-            // Push directories onto the queue
-            scoped.execute(|| {
-                let p = match queue.try_pop() {
-                    Some(p) => p,
-                    None => {
-                        //println!("Queue empty");
-                        done = true;
-                        return;
-                    }
+// Print all the files in the directories from the queu
+fn print(recv: BroadcastReceiver<PathBuf>, cluster: Pool<GlusterPool>, workers: u64) {
+    let mut handles = vec![];
+    for _ in 0..workers {
+        let stream_consumer = recv.add_stream();
+        handles.push(thread::spawn(move || {
+            for p in stream_consumer {
+                let sub_dir = GlusterDirectory {
+                    dir_handle: cluster.get().unwrap()
+                        .opendir(&p)
+                        .expect(&format!("failed to open dir: {}", p.display())),
                 };
-                //println!("try_pop: {}", p.display());
-                let sub_dir = GlusterDirectory { dir_handle: cluster.opendir(&p).unwrap() };
                 for s in sub_dir {
                     match s.file_type {
                         DT_REG => {
                             println!("{}/{}", p.display(), s.path.display());
-                        }
-                        DT_DIR => {
-                            if !(s.path == this || s.path == parent) {
-                                // Push the dir onto the queue for another thread to handle
-                                let mut pbuff = p.clone();
-                                pbuff.push(s.path);
-                                //println!("push dir: {}", pbuff.display());
-                                queue.push(pbuff);
-                            }
                         }
                         _ => {
                             //Nothing
                         }
                     }
                 }
-            });
+            }
+        }));
+    }
+    // Take notice that I drop the reader - this removes it from
+    // the queue, meaning that the readers in the new threads
+    // won't get starved by the lack of progress from recv
+    recv.unsubscribe();
+
+    for t in handles {
+        t.join();
+    }
+}
+
+fn search(queue: BroadcastSender<PathBuf>, p: &Path, cluster: Pool<GlusterPool>) {
+    thread::spawn(move || {
+        let this = Path::new(".");
+        let parent = Path::new("..");
+        let sub_dir = GlusterDirectory {
+            dir_handle: cluster.get().unwrap()
+                .opendir(&p)
+                .expect(&format!("failed to open dir: {}", p.display())),
+        };
+        for s in sub_dir {
+            match s.file_type {
+                DT_DIR => {
+                    if !(s.path == this || s.path == parent) {
+                        // Push the dir onto the queue for another thread to handle
+                        let mut pbuff = PathBuf::from(p);
+                        pbuff.push(s.path);
+                        queue.try_send(pbuff.clone());
+                        search(queue.clone(), &pbuff, cluster.clone());
+                    }
+                }
+                _ => {
+                    //Nothing
+                }
+            }
+        }
+    });
+}
+
+fn list(
+    server: &str,
+    port: u16,
+    volume: &str,
+    path: &Path,
+    workers: u64,
+) -> Result<(), GlusterError> {
+    let (send, recv) = broadcast_queue(workers);
+    let cluster = GlusterPool::new(server, port, volume);
+    let pool = Pool::new(cluster).unwrap();
+
+    send.try_send(path.to_path_buf());
+    search(send, path, pool.clone());
+
+    for _ in 0..workers-1{
+        thread::spawn(move || {
+            print(recv.clone(), pool.clone(), workers-1);
         });
 
         // What condition can I use to stop?
     }
+    drop(send);
+
     Ok(())
 }
 
@@ -128,7 +158,7 @@ fn main() {
         .get_matches();
 
     TermLogger::new(LogLevelFilter::Debug, Config::default()).unwrap();
-    let workers = u32::from_str(matches.value_of("workers").unwrap()).unwrap();
+    let workers = u64::from_str(matches.value_of("workers").unwrap()).unwrap();
     let port = u16::from_str(matches.value_of("port").unwrap()).unwrap();
     let server = matches.value_of("server").unwrap();
     let volume = matches.value_of("volume").unwrap();

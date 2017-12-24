@@ -7,9 +7,10 @@ license = "MIT"
 
 [dependencies]
 clap = "*"
-crossbeam = "*"
 gfapi-sys = "*"
 libc = "*"
 log = "*"
-scoped_threadpool = "~0.1"
+multiqueue = "*"
+r2d2 = "*"
+r2d2_gluster = "*"
 simplelog = "*"
