@@ -25,8 +25,10 @@ use simplelog::{Config, TermLogger};
 // Print all the files in the directories from the queu
 fn print(recv: BroadcastReceiver<PathBuf>, cluster: Pool<GlusterPool>, workers: u64) {
     let mut handles = vec![];
-    for _ in 0..workers {
+    for i in 0..workers {
+        trace!("Starting print worker: {}", i);
         let stream_consumer = recv.add_stream();
+        let cluster = cluster.clone();
         handles.push(thread::spawn(move || {
             for p in stream_consumer {
                 let sub_dir = GlusterDirectory {
@@ -53,11 +55,12 @@ fn print(recv: BroadcastReceiver<PathBuf>, cluster: Pool<GlusterPool>, workers: 
     recv.unsubscribe();
 
     for t in handles {
-        t.join();
+        t.join().expect("Couldn't join on the associated thread");
     }
 }
 
-fn search(queue: BroadcastSender<PathBuf>, p: &Path, cluster: Pool<GlusterPool>) {
+fn search(queue: BroadcastSender<PathBuf>, p: PathBuf, cluster: Pool<GlusterPool>) {
+    trace!("Starting directory search worker");
     thread::spawn(move || {
         let this = Path::new(".");
         let parent = Path::new("..");
@@ -71,10 +74,12 @@ fn search(queue: BroadcastSender<PathBuf>, p: &Path, cluster: Pool<GlusterPool>)
                 DT_DIR => {
                     if !(s.path == this || s.path == parent) {
                         // Push the dir onto the queue for another thread to handle
-                        let mut pbuff = PathBuf::from(p);
+                        let mut pbuff = p.clone();
                         pbuff.push(s.path);
-                        queue.try_send(pbuff.clone());
-                        search(queue.clone(), &pbuff, cluster.clone());
+                        if let Err(e) = queue.try_send(pbuff.clone()){
+                           error!("queue send failed: {}", e);
+                        }
+                        search(queue.clone(), pbuff, cluster.clone());
                     }
                 }
                 _ => {
@@ -96,12 +101,17 @@ fn list(
     let cluster = GlusterPool::new(server, port, volume);
     let pool = Pool::new(cluster).unwrap();
 
-    send.try_send(path.to_path_buf());
-    search(send, path, pool.clone());
+    if let Err(e) = send.try_send(path.to_path_buf()){
+        error!("Queueing path: {} failed: {}", path.display(), e);
+    }
+    let s = send.clone();
+    search(s, path.to_path_buf(), pool.clone());
 
     for _ in 0..workers-1{
+        let r = recv.clone();
+        let p = pool.clone();
         thread::spawn(move || {
-            print(recv.clone(), pool.clone(), workers-1);
+            print(r, p, workers-1);
         });
 
         // What condition can I use to stop?
