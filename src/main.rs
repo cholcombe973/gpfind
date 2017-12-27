@@ -16,23 +16,22 @@ use std::thread;
 use clap::{App, Arg};
 use gfapi_sys::gluster::*;
 use libc::{DT_DIR, DT_REG};
-use log::LogLevelFilter;
 use multiqueue::{broadcast_queue, BroadcastReceiver, BroadcastSender};
-use r2d2_gluster::*;
-use r2d2::Pool;
 use simplelog::{Config, TermLogger};
 
-// Print all the files in the directories from the queu
-fn print(recv: BroadcastReceiver<PathBuf>, cluster: Pool<GlusterPool>, workers: u64) {
+// Print all the files in the directories from the queue
+// This is limited to workers -1 number of print threads
+fn print(recv: BroadcastReceiver<PathBuf>, s: String, port: u16, v: String, workers: u64) {
     let mut handles = vec![];
     for i in 0..workers {
         trace!("Starting print worker: {}", i);
         let stream_consumer = recv.add_stream();
-        let cluster = cluster.clone();
         handles.push(thread::spawn(move || {
+            debug!("Connecting to gluster: {}:{}/{}", s, port, v);
+            let conn = Gluster::connect(&v, &s, port).expect("Connection to gluster failed");
             for p in stream_consumer {
                 let sub_dir = GlusterDirectory {
-                    dir_handle: cluster.get().unwrap()
+                    dir_handle: conn
                         .opendir(&p)
                         .expect(&format!("failed to open dir: {}", p.display())),
                 };
@@ -59,13 +58,18 @@ fn print(recv: BroadcastReceiver<PathBuf>, cluster: Pool<GlusterPool>, workers: 
     }
 }
 
-fn search(queue: BroadcastSender<PathBuf>, p: PathBuf, cluster: Pool<GlusterPool>) {
+// This will end up starting 1 thread per directory recursion
+// TODO: This might be a bit much.  Might need to back this off
+// to just 1 or a few threads total
+fn search(queue: BroadcastSender<PathBuf>, p: PathBuf, server: String, port: u16, v: String) {
     trace!("Starting directory search worker");
     thread::spawn(move || {
+        debug!("Connecting to gluster: {}:{}/{}", server, port, v);
+        let conn = Gluster::connect(&v, &server, port).expect("Connection to gluster failed");
         let this = Path::new(".");
         let parent = Path::new("..");
         let sub_dir = GlusterDirectory {
-            dir_handle: cluster.get().unwrap()
+            dir_handle: conn
                 .opendir(&p)
                 .expect(&format!("failed to open dir: {}", p.display())),
         };
@@ -76,10 +80,11 @@ fn search(queue: BroadcastSender<PathBuf>, p: PathBuf, cluster: Pool<GlusterPool
                         // Push the dir onto the queue for another thread to handle
                         let mut pbuff = p.clone();
                         pbuff.push(s.path);
-                        if let Err(e) = queue.try_send(pbuff.clone()){
-                           error!("queue send failed: {}", e);
+                        if let Err(e) = queue.try_send(pbuff.clone()) {
+                            error!("queue send failed: {}", e);
                         }
-                        search(queue.clone(), pbuff, cluster.clone());
+                        trace!("Recurse");
+                        search(queue.clone(), pbuff, server.clone(), port, v.clone());
                     }
                 }
                 _ => {
@@ -90,28 +95,21 @@ fn search(queue: BroadcastSender<PathBuf>, p: PathBuf, cluster: Pool<GlusterPool
     });
 }
 
-fn list(
-    server: &str,
-    port: u16,
-    volume: &str,
-    path: &Path,
-    workers: u64,
-) -> Result<(), GlusterError> {
+fn list(server: &str, port: u16, volume: &str, path: &Path, workers: u64) -> Result<(), String> {
+    debug!("Starting broadcast queue");
     let (send, recv) = broadcast_queue(workers);
-    let cluster = GlusterPool::new(server, port, volume);
-    let pool = Pool::new(cluster).unwrap();
-
-    if let Err(e) = send.try_send(path.to_path_buf()){
+    debug!("Seeding first path to check");
+    if let Err(e) = send.try_send(path.to_path_buf()) {
         error!("Queueing path: {} failed: {}", path.display(), e);
     }
     let s = send.clone();
-    search(s, path.to_path_buf(), pool.clone());
+    debug!("Beginning search");
+    search(s, path.to_path_buf(), server.to_string(), port.clone(), volume.to_string());
 
-    for _ in 0..workers-1{
+    for _ in 0..workers - 1 {
         let r = recv.clone();
-        let p = pool.clone();
         thread::spawn(move || {
-            print(r, p, workers-1);
+            print(r, server.to_string(), port.clone(), volume.to_string(), workers - 1);
         });
 
         // What condition can I use to stop?
@@ -154,7 +152,6 @@ fn main() {
                 .long("volume")
                 .help("The gluster volume to connect to")
                 .required(true)
-                .short("v")
                 .takes_value(true),
         )
         .arg(
@@ -165,9 +162,21 @@ fn main() {
                 .short("w")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("v")
+                .short("v")
+                .multiple(true)
+                .help("Sets the level of verbosity"),
+        )
         .get_matches();
 
-    TermLogger::new(LogLevelFilter::Debug, Config::default()).unwrap();
+    let level = match matches.occurrences_of("v") {
+        0 => simplelog::LogLevelFilter::Info, //default
+        1 => simplelog::LogLevelFilter::Debug,
+        _ => simplelog::LogLevelFilter::Trace,
+    };
+
+    TermLogger::init(level, Config::default()).unwrap();
     let workers = u64::from_str(matches.value_of("workers").unwrap()).unwrap();
     let port = u16::from_str(matches.value_of("port").unwrap()).unwrap();
     let server = matches.value_of("server").unwrap();
